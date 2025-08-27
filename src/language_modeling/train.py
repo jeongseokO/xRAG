@@ -33,6 +33,7 @@ from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 import deepspeed
 from tokenizers import AddedToken
 import wandb
+from huggingface_hub import HfApi
 
 ## own
 from src.model import (
@@ -40,6 +41,8 @@ from src.model import (
     XMistralConfig,
     XMixtralForCausalLM,
     XMixtralConfig,
+    XLlamaForCausalLM,
+    XLlamaConfig,
     SFR,
 )
 
@@ -90,7 +93,8 @@ def parse_args():
     )
     parser.add_argument(
         "--chat_format",
-        choices=['mistral','tulu','mixtral','qwen','yi','gemma']
+        choices=['mistral','tulu','mixtral','qwen','yi','gemma','llama'],
+        default='llama'
     )
     parser.add_argument(
         "--max_train_samples",
@@ -105,9 +109,19 @@ def parse_args():
         type=str,
     )
     parser.add_argument(
+        "--model_name",
+        type=str,
+        help="Alias for --model_name_or_path",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        help="Alias for --num_train_epochs",
+    )
+    parser.add_argument(
         "--config",
         type=str,
-        required=True,
+        default="config/language_modeling/pretrain.yaml",
         help="config file to launch the training"
     )
     parser.add_argument(
@@ -142,6 +156,9 @@ def parse_args():
         "--dev_file", type=str, default=None, help="A csv or a json file containing the dev data."
     )
     parser.add_argument(
+        "--hf_repo_id", type=str, default=None, help="HuggingFace repo id for uploading the best model."
+    )
+    parser.add_argument(
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
@@ -150,6 +167,7 @@ def parse_args():
     parser.add_argument(
         "--retriever_name_or_path",
         type=str,
+        default="Salesforce/SFR-Embedding-Mistral",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
@@ -239,6 +257,11 @@ def parse_args():
         assert hasattr(args,k), f"{k} not in parsed arguments"
         if getattr(args,k) is None:
             setattr(args,k,v)
+
+    if args.model_name is not None:
+        args.model_name_or_path = args.model_name
+    if args.epochs is not None:
+        args.num_train_epochs = args.epochs
 
     args.train_file = os.path.join(args.workdir,args.train_file)
     if args.dev_file is not None:args.dev_file = os.path.join(args.workdir,args.dev_file)
@@ -337,8 +360,9 @@ def collator(
 
 
 @torch.no_grad()
-def validate_during_pretrain(model,dataloader,accelerator,vocab_size,retriever):
+def validate_during_pretrain(model, dataloader, accelerator, vocab_size, retriever):
     model.eval()
+    retriever.eval()
     total_loss = []
     for batch in dataloader:
         retrieval_embeds = get_retrieval_embeds(
@@ -358,6 +382,7 @@ def validate_during_pretrain(model,dataloader,accelerator,vocab_size,retriever):
         )
         total_loss.append(nll_loss.item())
     model.train()
+    retriever.train()
     if accelerator.use_distributed and accelerator.num_processes>1:
         all_ranks_objects = [None for _ in range(accelerator.num_processes)]
         dist.all_gather_object(all_ranks_objects,total_loss)
@@ -379,7 +404,7 @@ def main():
             retriever_tokenizer = AutoTokenizer.from_pretrained(args.retriever_name_or_path)
         retrieval_embed_length = retriever.get_embed_length()
         retriever_hidden_size = retriever.get_embed_dim()
-        retriever.eval()
+        retriever.train()
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, log_with="wandb")
     accelerator.init_trackers(
@@ -404,6 +429,7 @@ def main():
 
     if retriever is not None:
         retriever = retriever.to(accelerator.device)
+        retriever.train()
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -454,9 +480,12 @@ def main():
 
     if args.chat_format == 'mixtral':
         MODEL_CLASS,CONFIG_CLASS = XMixtralForCausalLM,XMixtralConfig
-        tokenizer.padding_side = 'left'    
+        tokenizer.padding_side = 'left'
     if args.chat_format == 'mistral':
         MODEL_CLASS,CONFIG_CLASS = XMistralForCausalLM,XMistralConfig
+        tokenizer.padding_side = 'left'
+    if args.chat_format == 'llama':
+        MODEL_CLASS,CONFIG_CLASS = XLlamaForCausalLM, XLlamaConfig
         tokenizer.padding_side = 'left'
     config = CONFIG_CLASS.from_pretrained(args.model_name_or_path,retriever_hidden_size=retriever_hidden_size)
     model = MODEL_CLASS.from_pretrained(
@@ -482,6 +511,7 @@ def main():
     if num_added_tokens > 0:
         model.resize_token_embeddings(len(tokenizer))
     vocab_size = len(tokenizer)
+    model.requires_grad_(False)
 
     # Preprocessing the datasets.
     if args.task_type == 'finetune':
@@ -548,26 +578,9 @@ def main():
             collate_fn=collate_fn,
             batch_size=args.per_device_train_batch_size
         )
-    
-    if args.update_projector_only:
-        for n,p in model.named_parameters():
-            if 'projector' not in n:p.requires_grad = False
-            else:p.requires_grad = True
-                
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=args.learning_rate)
-    else:
-        no_decay = ["bias", "layer_norm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": args.weight_decay,
-            },
-            {
-                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    if retriever is None:
+        raise ValueError("Retriever model is required for compressor training")
+    optimizer = torch.optim.AdamW(retriever.parameters(), lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -597,12 +610,12 @@ def main():
 
     # Prepare everything with `accelerator`.
     if dev_dataset is not None:
-        model, optimizer, train_dataloader, lr_scheduler, dev_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler, dev_dataloader)
+        model, retriever, optimizer, train_dataloader, lr_scheduler, dev_dataloader = accelerator.prepare(
+            model, retriever, optimizer, train_dataloader, lr_scheduler, dev_dataloader)
 
     else:
-        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler)
+        model, retriever, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model, retriever, optimizer, train_dataloader, lr_scheduler)
 
 
     
@@ -634,6 +647,7 @@ def main():
 
     completed_steps = 0
     starting_epoch = 0
+    best_ppl = float("inf")
 
     # logging_interval_grad_norm = 0
     logging_interval_loss = 0
@@ -676,7 +690,7 @@ def main():
                 accelerator.print('\n'+"**"*20,"show one example","**"*20)
                 save_one_sample=False
 
-            with accelerator.accumulate(model):
+            with accelerator.accumulate(retriever):
                 ## forward with retrieval embeds
                 retrieval_kwargs = {}
                 if retriever is not None:
@@ -732,7 +746,7 @@ def main():
                 logging_interval_loss += loss.detach().float()
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and args.clip_grad_norm > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                    accelerator.clip_grad_norm_(retriever.parameters(), args.clip_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
                 lr_scheduler.step()       
@@ -768,7 +782,7 @@ def main():
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
                         output_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
-                        save_with_accelerate(accelerator, model, tokenizer, output_dir,save_projector_only=args.update_projector_only)
+                        save_with_accelerate(accelerator, model, tokenizer, output_dir,save_projector_only=False)
 
                         if dev_dataloader is not None:
                             if args.task_type == 'pretrain':
@@ -778,15 +792,40 @@ def main():
                 if completed_steps >= args.max_train_steps:
                     break
 
+        if dev_dataloader is not None:
+            ppl = validate_during_pretrain(model, dev_dataloader, accelerator, vocab_size, retriever)
+            accelerator.log({"dev_ppl": ppl}, step=completed_steps)
+            if ppl < best_ppl:
+                best_ppl = ppl
+                output_dir = os.path.join(args.output_dir, "best")
+                save_with_accelerate(accelerator, model, tokenizer, output_dir, save_projector_only=False)
+                if retriever is not None and accelerator.is_main_process:
+                    comp_dir = os.path.join(output_dir, "compressor")
+                    os.makedirs(comp_dir, exist_ok=True)
+                    accelerator.unwrap_model(retriever).model.save_pretrained(comp_dir)
+                    if retriever_tokenizer is not None:
+                        retriever_tokenizer.save_pretrained(comp_dir)
+
         if args.checkpointing_steps == "epoch":
             output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
-            save_with_accelerate(accelerator, model, tokenizer, output_dir,save_projector_only=args.update_projector_only)
+            save_with_accelerate(accelerator, model, tokenizer, output_dir,save_projector_only=False)
 
     accelerator.end_training()
 
     ## save the last one
     output_dir = os.path.join(args.output_dir,"last")
     save_with_accelerate(accelerator, model, tokenizer, output_dir,save_projector_only=False)
+    if retriever is not None and accelerator.is_main_process:
+        comp_dir = os.path.join(output_dir, "compressor")
+        os.makedirs(comp_dir, exist_ok=True)
+        accelerator.unwrap_model(retriever).model.save_pretrained(comp_dir)
+        if retriever_tokenizer is not None:
+            retriever_tokenizer.save_pretrained(comp_dir)
+    if args.hf_repo_id is not None and accelerator.is_main_process:
+        api = HfApi()
+        best_dir = os.path.join(args.output_dir, "best")
+        if os.path.exists(best_dir):
+            api.upload_folder(folder_path=best_dir, repo_id=args.hf_repo_id, repo_type="model")
 
 if __name__ == "__main__":
     main()

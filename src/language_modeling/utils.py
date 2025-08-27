@@ -210,14 +210,14 @@ RAGInstructions = [
 
 
 
-def get_retrieval_embeds(model,input_ids,attention_mask=None):
-    with torch.no_grad():
-        embeds = model.get_doc_embedding(
-            input_ids = input_ids,
-            attention_mask = attention_mask,
-        )
-    embeds = embeds.view(-1,embeds.shape[-1])
-    return embeds 
+def get_retrieval_embeds(model, input_ids, attention_mask=None):
+    """Obtain retrieval embeddings with gradient flow."""
+    embeds = model.get_doc_embedding(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    )
+    embeds = embeds.view(-1, embeds.shape[-1])
+    return embeds
 
 def calculate_grad_norm(model, norm_type=2):  
     total_norm = 0  
